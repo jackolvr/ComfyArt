@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import uuid
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 
 import aiohttp
 import folder_paths
@@ -17,7 +17,8 @@ from ._common import app_path, bad_request, error, json_body, read_json, routes,
 from .cloud import ANNOTATED
 
 PROBE = aiohttp.ClientTimeout(total=5, sock_connect=1)
-TRANSFER = aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=120)
+READ_TIMEOUT_DEFAULT = 600
+CTL = aiohttp.ClientTimeout(total=15, sock_connect=5)
 RELAY_S = 3600
 PREFIX = "srv:"
 
@@ -51,6 +52,21 @@ def _local() -> dict:
     return {"id": "local", "label": "local", "host": host, "port": server.port, "scheme": scheme}
 
 
+def _read_timeout(inst: dict) -> float:
+    for raw in (inst.get("read_timeout"), os.environ.get("COMFYART_REMOTE_READ_TIMEOUT")):
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return READ_TIMEOUT_DEFAULT
+
+
+def _transfer(inst: dict) -> aiohttp.ClientTimeout:
+    return aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=_read_timeout(inst))
+
+
 def _base(inst: dict) -> str:
     host = f"[{inst['host']}]" if ":" in inst["host"] else inst["host"]
     return f"{inst.get('scheme', 'http')}://{host}:{inst['port']}"
@@ -69,7 +85,33 @@ def _fields(body: dict, base: dict) -> dict:
     except (TypeError, ValueError):
         raise bad_request("port must be an integer")
     label = str(body.get("label") or base.get("label") or host).strip()
-    return {**base, "label": label, "host": host, "port": port, "enabled": bool(body.get("enabled", base.get("enabled", True)))}
+    item = {**base, "label": label, "host": host, "port": port, "enabled": bool(body.get("enabled", base.get("enabled", True)))}
+    for key in ("ctl_url", "read_timeout"):
+        if key not in body:
+            continue
+        value = body[key]
+        if value in (None, ""):
+            item.pop(key, None)
+        elif key == "ctl_url":
+            item[key] = _ctl_url(value)
+        else:
+            try:
+                item[key] = float(value)
+            except (TypeError, ValueError):
+                raise bad_request("read_timeout must be a number of seconds")
+            if item[key] <= 0:
+                raise bad_request("read_timeout must be positive")
+    return item
+
+
+def _ctl_url(value) -> str:
+    url = str(value).strip().rstrip("/")
+    parts = urlparse(url)
+    loopback = parts.hostname in ("127.0.0.1", "localhost", "::1")
+    # the API key is sent to this URL, so plain http is only allowed for loopback
+    if not parts.hostname or parts.scheme not in ("http", "https") or (parts.scheme == "http" and not loopback):
+        raise bad_request("ctl_url must be an https URL")
+    return url
 
 
 @routes.get("/comfyart/instances")
@@ -108,13 +150,42 @@ async def _load(session: aiohttp.ClientSession, inst: dict) -> int:
     return len(queue.get("queue_running") or []) + len(queue.get("queue_pending") or [])
 
 
+def _ctl_headers() -> dict[str, str]:
+    key = os.environ.get("ZITPOC_API_KEY")
+    return {"x-api-key": key} if key else {}
+
+
+async def _ctl(session: aiohttp.ClientSession, inst: dict, method: str, path: str) -> tuple[int, dict]:
+    if not os.environ.get("ZITPOC_API_KEY"):
+        raise _fail(web.HTTPBadRequest, "the control endpoint needs an API key: set ZITPOC_API_KEY and restart ComfyUI")
+    async with session.request(method, f"{inst['ctl_url']}{path}", headers=_ctl_headers()) as res:
+        body = await res.json(content_type=None) if res.content_length != 0 else {}
+        return res.status, body if isinstance(body, dict) else {}
+
+
+async def _power(inst: dict) -> dict:
+    """What the control endpoint says about an unreachable instance: {"power": "OFF"|..., "ready": bool} or {"power": "UNKNOWN", "ctl_error": ...}."""
+    try:
+        async with _session(CTL) as session:
+            code, body = await _ctl(session, inst, "GET", "/status")
+    except web.HTTPException as e:
+        return {"power": "UNKNOWN", "ctl_error": json.loads(e.text)["error"]["message"]}
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        return {"power": "UNKNOWN", "ctl_error": type(e).__name__}
+    if code != 200 or not isinstance(body.get("status"), str):
+        return {"power": "UNKNOWN", "ctl_error": f"control endpoint answered {code}"}
+    return {"power": body["status"], "ready": bool(body.get("ready"))}
+
+
 async def _status(session: aiohttp.ClientSession, inst: dict) -> dict:
     try:
         load = await _load(session, inst)
         async with session.get(f"{_base(inst)}/models/diffusion_models") as res:
             models = await res.json() if res.ok else []
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
-        return {"id": inst["id"], "online": False, "error": str(e) or type(e).__name__}
+        down = {"id": inst["id"], "online": False, "error": str(e) or type(e).__name__}
+        # with a ctl_url, tell "switched off" (power OFF) apart from "unreachable" (power UNKNOWN or a booting state)
+        return {**down, **await _power(inst)} if inst.get("ctl_url") else down
     return {"id": inst["id"], "online": True, "queue": load, "models": [m.replace("\\", "/").rsplit("/", 1)[-1] for m in models]}
 
 
@@ -123,6 +194,21 @@ async def instances_status(_request: web.Request) -> web.Response:
     async with _session(PROBE) as session:
         statuses = await asyncio.gather(*(_status(session, i) for i in list_instances() if i["enabled"]))
     return web.json_response({"statuses": statuses})
+
+
+@routes.post("/comfyart/instances/{iid}/start")
+async def start_instance(request: web.Request) -> web.Response:
+    inst = _instance(request.match_info["iid"])
+    if not inst.get("ctl_url"):
+        return error(f"LAN instance {inst['label']} has no ctl_url", 400)
+    try:
+        async with _session(CTL) as session:
+            code, body = await _ctl(session, inst, "POST", "/start")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        raise _fail(web.HTTPBadGateway, f"cannot reach the control endpoint of {inst['label']}: {type(e).__name__}")
+    if code not in (200, 202):
+        return error(f"the control endpoint of {inst['label']} answered {code}", 502)
+    return web.json_response({"started": code == 202, "status": body.get("status"), "job_id": body.get("job_id")})
 
 
 def _options(spec) -> list | None:
@@ -193,10 +279,27 @@ async def _pick(graph: dict) -> tuple[dict, dict]:
     return local[1], local[2]
 
 
-def _upload_name(path: str) -> str:
-    stat = os.stat(path)
-    digest = hashlib.sha1(f"{path}:{stat.st_mtime_ns}:{stat.st_size}".encode()).hexdigest()[:12]
-    return f"{digest}-{os.path.basename(path)}"
+def _sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _upload_name(path: str, digest: str) -> str:
+    # named by content, so the same name on the same instance always means the same bytes
+    return f"{digest[:24]}-{os.path.basename(path)}"
+
+
+async def _already_there(session: aiohttp.ClientSession, inst: dict, name: str) -> bool:
+    # revalidate on every job instead of remembering: a rebooted or wiped Spot server answers 404 and we just upload again
+    query = urlencode({"filename": name, "subfolder": "comfyart", "type": "input"})
+    try:
+        async with session.head(f"{_base(inst)}/view?{query}") as res:
+            return res.status == 200
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return False
 
 
 async def _upload_inputs(session: aiohttp.ClientSession, inst: dict, graph: dict) -> None:
@@ -207,17 +310,21 @@ async def _upload_inputs(session: aiohttp.ClientSession, inst: dict, graph: dict
                 continue
             path = folder_paths.get_annotated_filepath(value)
             if value not in uploaded and os.path.isfile(path):
-                form = aiohttp.FormData()
-                form.add_field("subfolder", "comfyart")
-                form.add_field("type", "input")
-                form.add_field("overwrite", "true")
-                with open(path, "rb") as f:
-                    form.add_field("image", f, filename=_upload_name(path), content_type="application/octet-stream")
-                    async with session.post(f"{_base(inst)}/upload/image", data=form) as res:
-                        if res.status != 200:
-                            raise _fail(web.HTTPBadGateway, f"uploading {os.path.basename(path)} to {inst['label']} failed: {res.status}")
-                        info = await res.json()
-                uploaded[value] = f"{info.get('subfolder') or 'comfyart'}/{info['name']} [input]"
+                filename = _upload_name(path, await asyncio.to_thread(_sha256, path))
+                if await _already_there(session, inst, filename):
+                    uploaded[value] = f"comfyart/{filename} [input]"
+                else:
+                    form = aiohttp.FormData()
+                    form.add_field("subfolder", "comfyart")
+                    form.add_field("type", "input")
+                    form.add_field("overwrite", "true")
+                    with open(path, "rb") as f:
+                        form.add_field("image", f, filename=filename, content_type="application/octet-stream")
+                        async with session.post(f"{_base(inst)}/upload/image", data=form) as res:
+                            if res.status != 200:
+                                raise _fail(web.HTTPBadGateway, f"uploading {os.path.basename(path)} to {inst['label']} failed: {res.status}")
+                            info = await res.json()
+                    uploaded[value] = f"{info.get('subfolder') or 'comfyart'}/{info['name']} [input]"
             node["inputs"][name] = uploaded.get(value, value)
 
 
@@ -238,7 +345,7 @@ async def _forward_progress(ws: aiohttp.ClientWebSocketResponse, inst: dict, rem
 
 
 async def _relay(inst: dict, client_id: str, connected: asyncio.Future, remote: asyncio.Future) -> None:
-    async with _session(TRANSFER) as session:
+    async with _session(_transfer(inst)) as session:
         try:
             ws = await session.ws_connect(f"{_base(inst).replace('http', 'ws', 1)}/ws?clientId={client_id}", heartbeat=30)
         except aiohttp.ClientError as e:
@@ -261,7 +368,7 @@ async def _submit_remote(inst: dict, graph: dict) -> web.Response:
     _relays.add(relay)
     relay.add_done_callback(_relays.discard)
     try:
-        async with _session(TRANSFER) as session:
+        async with _session(_transfer(inst)) as session:
             await _upload_inputs(session, inst, graph)
             await connected
             async with session.post(f"{_base(inst)}/prompt", json={"prompt": graph, "client_id": client_id}) as res:
@@ -281,7 +388,7 @@ async def _submit_remote(inst: dict, graph: dict) -> web.Response:
 
 async def _submit_local(inst: dict, graph: dict, client_id: str, user: str | None) -> web.Response:
     headers = {"Comfy-User": user} if user else {}
-    async with _session(TRANSFER) as session:
+    async with _session(_transfer(inst)) as session:
         async with session.post(f"{_base(inst)}/prompt", json={"prompt": graph, "client_id": client_id}, headers=headers) as res:
             body = await res.json(content_type=None)
     if res.status >= 400:
@@ -346,7 +453,7 @@ async def remote_history(request: web.Request) -> web.Response:
     remote_id = request.match_info["pid"]
     prompt_id = f"{PREFIX}{inst['id']}:{remote_id}"
     try:
-        async with _session(TRANSFER) as session:
+        async with _session(_transfer(inst)) as session:
             async with session.get(f"{_base(inst)}/history/{remote_id}") as res:
                 entry = (await res.json()).get(remote_id)
             if entry is None:

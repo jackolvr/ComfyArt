@@ -14,7 +14,7 @@ UNETS = ["qwen/qwen_image_2512_fp8_e4m3fn.safetensors", "z_image_turbo_bf16.safe
 
 
 def fake_comfy(classes: dict):
-    state = {"pending": [], "running": [], "history": {}, "prompts": [], "uploads": [], "posts": [], "sockets": []}
+    state = {"pending": [], "running": [], "history": {}, "prompts": [], "uploads": [], "posts": [], "sockets": [], "files": set()}
 
     async def queue(request: web.Request):
         if request.method == "POST":
@@ -29,6 +29,7 @@ def fake_comfy(classes: dict):
     async def upload(request: web.Request):
         data = await request.post()
         state["uploads"].append((data["subfolder"], data["image"].filename))
+        state["files"].add(data["image"].filename)
         return web.json_response({"name": data["image"].filename, "subfolder": data["subfolder"], "type": "input"})
 
     async def prompt(request: web.Request):
@@ -55,6 +56,8 @@ def fake_comfy(classes: dict):
         return web.json_response({pid: state["history"][pid]} if pid in state["history"] else {})
 
     async def view(request: web.Request):
+        if request.query.get("type") == "input" and request.query["filename"] not in state["files"]:
+            return web.Response(status=404)
         return web.Response(body=f"bytes:{request.query['filename']}".encode())
 
     async def interrupt(request: web.Request):
@@ -231,3 +234,94 @@ async def test_unknown_instance_is_a_clear_error(bot_client, comfies):
     res = await bot_client.get("/comfyart/remote/history/gone/p1")
     assert res.status == 404
     assert "no longer registered" in (await res.json())["error"]["message"]
+
+
+async def test_same_content_is_uploaded_once_and_reuploaded_after_a_wipe(bot_client, comfies, fresh_user_dir):
+    start, _ = comfies
+    addr, state = await start(COMMON)
+    inst = await add(bot_client, addr, "spark")
+    body = {"prompt": GRAPH, "target": inst["id"], "client_id": "c1"}
+    await bot_client.post("/comfyart/remote/prompt", json=body)
+    await bot_client.post("/comfyart/remote/prompt", json=body)
+    assert len(state["uploads"]) == 1
+    assert state["prompts"][1][1]["prompt"]["3"] == state["prompts"][0][1]["prompt"]["3"]
+    (fresh_user_dir / "input" / "comfyart" / "ref.png").write_bytes(b"changed")
+    await bot_client.post("/comfyart/remote/prompt", json=body)
+    assert len(state["uploads"]) == 2 and state["uploads"][0][1] != state["uploads"][1][1]
+    state["files"].clear()  # the remote rebooted with a clean disk
+    await bot_client.post("/comfyart/remote/prompt", json=body)
+    assert len(state["uploads"]) == 3
+
+
+def test_read_timeout_instance_then_env_then_default(monkeypatch):
+    monkeypatch.delenv("COMFYART_REMOTE_READ_TIMEOUT", raising=False)
+    assert remote._transfer({}).sock_read == remote.READ_TIMEOUT_DEFAULT == 600
+    monkeypatch.setenv("COMFYART_REMOTE_READ_TIMEOUT", "900")
+    assert remote._transfer({}).sock_read == 900
+    assert remote._transfer({"read_timeout": 30}).sock_read == 30
+    monkeypatch.setenv("COMFYART_REMOTE_READ_TIMEOUT", "junk")
+    assert remote._transfer({"read_timeout": 0}).sock_read == 600
+
+
+def fake_ctl(power: dict):
+    seen = []
+
+    async def status(request: web.Request):
+        seen.append(("status", request.headers.get("x-api-key")))
+        return web.json_response({"status": power["status"], "job_id": None, "ready": power["status"] == "RUNNING"})
+
+    async def begin(request: web.Request):
+        seen.append(("start", request.headers.get("x-api-key")))
+        fresh = power["status"] == "OFF"
+        power["status"] = "SUBMITTED"
+        return web.json_response({"status": "SUBMITTED", "job_id": "j1"}, status=202 if fresh else 200)
+
+    app = web.Application()
+    app.router.add_get("/status", status)
+    app.router.add_post("/start", begin)
+    return app, seen
+
+
+async def test_ctl_url_tells_off_from_unreachable_and_starts_on_demand(bot_client, comfies, monkeypatch):
+    power = {"status": "OFF"}
+    ctl_app, seen = fake_ctl(power)
+    ctl = TestServer(ctl_app)
+    await ctl.start_server()
+    try:
+        monkeypatch.setenv("ZITPOC_API_KEY", "k-secret")
+        ctl_url = f"http://{ctl.host}:{ctl.port}/"
+        res = await bot_client.post("/comfyart/instances", json={"label": "z", "host": "127.0.0.1", "port": 1, "ctl_url": ctl_url})
+        inst = (await res.json())["instance"]
+        assert inst["ctl_url"] == ctl_url.rstrip("/")
+        st = (await (await bot_client.get("/comfyart/instances/status")).json())["statuses"][0]
+        assert st["online"] is False and st["power"] == "OFF" and st["ready"] is False
+        assert seen == [("status", "k-secret")]
+        res = await bot_client.post(f"/comfyart/instances/{inst['id']}/start")
+        assert (await res.json()) == {"started": True, "status": "SUBMITTED", "job_id": "j1"}
+        res = await bot_client.post(f"/comfyart/instances/{inst['id']}/start")
+        assert (await res.json())["started"] is False
+        assert seen[1:] == [("start", "k-secret")] * 2
+        monkeypatch.delenv("ZITPOC_API_KEY")
+        st = (await (await bot_client.get("/comfyart/instances/status")).json())["statuses"][0]
+        assert st["power"] == "UNKNOWN" and "ZITPOC_API_KEY" in st["ctl_error"]
+        assert (await bot_client.post(f"/comfyart/instances/{inst['id']}/start")).status == 400
+        assert "k-secret" not in await (await bot_client.get("/comfyart/instances")).text()
+        # clearing the field removes it
+        res = await bot_client.patch(f"/comfyart/instances/{inst['id']}", json={"ctl_url": ""})
+        assert "ctl_url" not in (await res.json())["instance"]
+        assert (await bot_client.post(f"/comfyart/instances/{inst['id']}/start")).status == 400
+    finally:
+        await ctl.close()
+
+
+async def test_ctl_url_must_be_https_unless_loopback(bot_client, comfies):
+    res = await bot_client.post("/comfyart/instances", json={"label": "z", "host": "h", "ctl_url": "http://evil.example/x"})
+    assert res.status == 400
+    res = await bot_client.post("/comfyart/instances", json={"label": "z", "host": "h", "ctl_url": "https://abc.lambda-url.us-east-1.on.aws/"})
+    assert res.status == 200
+
+
+async def test_status_without_ctl_url_is_unchanged_when_offline(bot_client, comfies):
+    res = await bot_client.post("/comfyart/instances", json={"label": "z", "host": "127.0.0.1", "port": 1})
+    st = (await (await bot_client.get("/comfyart/instances/status")).json())["statuses"][0]
+    assert set(st) == {"id", "online", "error"}
