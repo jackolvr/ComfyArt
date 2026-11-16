@@ -64,6 +64,8 @@ export const IMAGE_MODELS: ModelDef[] = [
 
 export const VIDEO_MODELS: ModelDef[] = [
   { id: 't2v-minimax-h3.api.json', label: 'MiniMax H3', desc: t('models.syncedAudioAndVideoSupports'), files: ['minimax_h3_fl2va_pruned_int8_convrot.safetensors'], video: true },
+  { id: 't2v-ltx23.api.json', label: 'LTX 2.3', desc: t('models.ltx23Desc'), files: ['pinkcherry_v18_fp8scaled.safetensors', 'gemma_heretic_fp8.safetensors', 'ltx23_distilled_lora.safetensors'], video: true },
+  { id: 'i2v-wan22.api.json', label: 'Wan 2.2 I2V 14B', desc: t('models.wan22Desc'), files: ['wan_high_fp8.safetensors', 'wan_low_fp8.safetensors', 'rz_high.safetensors', 'rz_low.safetensors'], video: true },
 ]
 
 export const isVideo = (workflow: string) => VIDEO_MODELS.some((m) => m.id === workflow)

@@ -260,3 +260,42 @@ export async function storyboardGraph(scenes: Scene[], aspect: number, firstFram
   g[id.save].inputs.video = ['concat', 0]
   return { graph: g, result: id.save, partial: scenes.map((_, i) => `keep${i}`) }
 }
+
+export const LTX_WORKFLOW = 't2v-ltx23.api.json'  // the i2v twin is picked by ltxGraph when there is a first frame
+export const WAN_WORKFLOW = 'i2v-wan22.api.json'
+export const isMiniMax = (workflow: string) => workflow !== LTX_WORKFLOW && workflow !== WAN_WORKFLOW
+
+const frames = (seconds: number, fps: number, step: number) => Math.max(1, Math.round(seconds * fps / step)) * step + 1
+const landscape = (aspect: number) => aspect >= 1
+
+// LTX 2.3 (audio included): 704x1280 or 1280x704, 24 fps, frames 8n+1. The i2v file is the same graph with the image as first frame.
+export async function ltxGraph(image: string | null, prompt: string, aspect: number, duration: number): Promise<Built> {
+  const [w, h] = landscape(aspect) ? [1280, 704] : [704, 1280]
+  const len = frames(duration, 24, 8)
+  const { graph: g, id }: { graph: PromptGraph; id: Record<string, string> } = image
+    ? await loadNamed('i2v-ltx23.api.json', 'prompt', 'size', 'audio', 'seed', 'save', 'image', 'scale')
+    : await loadNamed('t2v-ltx23.api.json', 'prompt', 'size', 'audio', 'seed', 'save')
+  g[id.prompt].inputs.text = prompt || MOTION
+  Object.assign(g[id.size].inputs, { width: w, height: h, length: len })
+  g[id.audio].inputs.frames_number = len
+  g[id.seed].inputs.noise_seed = randomSeed()
+  if (image) {
+    g[id.image].inputs.image = image
+    Object.assign(g[id.scale].inputs, { width: w, height: h })
+  }
+  return { graph: g, result: id.save }
+}
+
+// Wan 2.2 I2V 14B: always starts from an image; 16 fps, frames 4n+1, sizes multiple of 16.
+export async function wanGraph(image: string | null, prompt: string, aspect: number, duration: number): Promise<Built> {
+  if (!image) throw new Error(t('models.wan22NeedsImage'))
+  const [w, h] = landscape(aspect) ? [1280, 720] : [720, 1280]
+  const { graph: g, id } = await loadNamed('i2v-wan22.api.json', 'prompt', 'size', 'image', 'seed', 'seed2', 'save')
+  g[id.prompt].inputs.text = prompt || MOTION
+  Object.assign(g[id.size].inputs, { width: w, height: h, length: frames(duration, 16, 4) })
+  g[id.image].inputs.image = image
+  const seed = randomSeed()
+  g[id.seed].inputs.noise_seed = seed
+  g[id.seed2].inputs.noise_seed = seed
+  return { graph: g, result: id.save }
+}

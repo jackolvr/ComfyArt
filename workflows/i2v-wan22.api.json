@@ -1,0 +1,260 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "wan_high_fp8.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "2": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "wan_low_fp8.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "3": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "lora_name": "rz_high.safetensors",
+      "strength_model": 1.0
+    }
+  },
+  "4": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "model": [
+        "2",
+        0
+      ],
+      "lora_name": "rz_low.safetensors",
+      "strength_model": 1.0
+    }
+  },
+  "5": {
+    "class_type": "ModelSamplingSD3",
+    "inputs": {
+      "model": [
+        "3",
+        0
+      ],
+      "shift": 5.0
+    }
+  },
+  "6": {
+    "class_type": "ModelSamplingSD3",
+    "inputs": {
+      "model": [
+        "4",
+        0
+      ],
+      "shift": 5.0
+    }
+  },
+  "7": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    }
+  },
+  "8": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "Prompt",
+      "clip": [
+        "7",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "@prompt"
+    }
+  },
+  "9": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "blurry, low quality, distorted, deformed, extra limbs, bad anatomy, watermark, text, static, overexposed",
+      "clip": [
+        "7",
+        0
+      ]
+    }
+  },
+  "10": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "wan_2.1_vae.safetensors"
+    }
+  },
+  "11": {
+    "class_type": "CLIPVisionLoader",
+    "inputs": {
+      "clip_name": "clip_vision_h.safetensors"
+    }
+  },
+  "12": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "in.png"
+    },
+    "_meta": {
+      "title": "@image"
+    }
+  },
+  "13": {
+    "class_type": "CLIPVisionEncode",
+    "inputs": {
+      "clip_vision": [
+        "11",
+        0
+      ],
+      "image": [
+        "12",
+        0
+      ],
+      "crop": "center"
+    }
+  },
+  "14": {
+    "class_type": "WanImageToVideo",
+    "inputs": {
+      "positive": [
+        "8",
+        0
+      ],
+      "negative": [
+        "9",
+        0
+      ],
+      "vae": [
+        "10",
+        0
+      ],
+      "width": 720,
+      "height": 1280,
+      "length": 81,
+      "batch_size": 1,
+      "clip_vision_output": [
+        "13",
+        0
+      ],
+      "start_image": [
+        "12",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "@size"
+    }
+  },
+  "15": {
+    "class_type": "KSamplerAdvanced",
+    "inputs": {
+      "model": [
+        "5",
+        0
+      ],
+      "add_noise": "enable",
+      "noise_seed": 1,
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "positive": [
+        "14",
+        0
+      ],
+      "negative": [
+        "14",
+        1
+      ],
+      "latent_image": [
+        "14",
+        2
+      ],
+      "start_at_step": 0,
+      "end_at_step": 2,
+      "return_with_leftover_noise": "enable"
+    },
+    "_meta": {
+      "title": "@seed"
+    }
+  },
+  "16": {
+    "class_type": "KSamplerAdvanced",
+    "inputs": {
+      "model": [
+        "6",
+        0
+      ],
+      "add_noise": "disable",
+      "noise_seed": 1,
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "positive": [
+        "14",
+        0
+      ],
+      "negative": [
+        "14",
+        1
+      ],
+      "latent_image": [
+        "15",
+        0
+      ],
+      "start_at_step": 2,
+      "end_at_step": 10000,
+      "return_with_leftover_noise": "disable"
+    },
+    "_meta": {
+      "title": "@seed2"
+    }
+  },
+  "17": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "16",
+        0
+      ],
+      "vae": [
+        "10",
+        0
+      ]
+    }
+  },
+  "18": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": [
+        "17",
+        0
+      ],
+      "fps": 16.0
+    }
+  },
+  "19": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": [
+        "18",
+        0
+      ],
+      "filename_prefix": "comfyart/video",
+      "format": "mp4",
+      "codec": "h264"
+    },
+    "_meta": {
+      "title": "@save"
+    }
+  }
+}

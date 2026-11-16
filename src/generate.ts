@@ -11,7 +11,7 @@ import { t } from './i18n'
 import { applyRefs, PALETTE_MODE, refControlsOf, refHints, refLimit, refModesOf, refStrengthsOf, usableRefs } from './refModes'
 import { paletteImage, palettePrompt } from './palette'
 import { annotated, randomSeed, type Built } from './workflows'
-import { imageToVideoGraph, lipSyncGraph, MAX_VIDEO_REF_KINDS, motionGraph, r2vGraph, storyboardGraph, t2vGraph, VIDEO_AREAS, videoSize, type Scene } from './videoGraphs'
+import { imageToVideoGraph, isMiniMax, lipSyncGraph, ltxGraph, LTX_WORKFLOW, MAX_VIDEO_REF_KINDS, motionGraph, r2vGraph, storyboardGraph, t2vGraph, VIDEO_AREAS, videoSize, wanGraph, type Scene } from './videoGraphs'
 import { SHOTS, STYLES, VIDEO_RATIOS } from './genOptions'
 
 export function scenesOf(shape: GeneratorShape): Scene[] {
@@ -133,6 +133,11 @@ async function generateGraph(shape: GeneratorShape): Promise<Built> {
     colors.length > 0 && palettePrompt(colors),
   ].filter(Boolean).join(' ')
   if (isVideo(workflow)) {
+    if (!isMiniMax(workflow)) {
+      // LTX 2.3 / Wan 2.2: plain text/first-frame to video only (no storyboard, reference, motion or lip-sync modes)
+      const first = refs.find((src) => refKind(src) === 'image')
+      return (workflow === LTX_WORKFLOW ? ltxGraph : wanGraph)(first ? annotated(first) : null, prompt, ratioOf(ratio), duration)
+    }
     const area = VIDEO_AREAS[shape.props.resolution] ?? VIDEO_AREAS['768p']
     const scenes = scenesOf(shape).filter((sc) => sc.prompt.trim())
     if (scenes.length) {

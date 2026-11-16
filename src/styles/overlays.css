@@ -311,4 +311,5 @@
 .ca-instances__name { display: flex; flex: 1; flex-direction: column; gap: 2px; min-width: 0; }
 .ca-instances__toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; }
 .ca-instances__add { display: grid; grid-template-columns: 1fr 1.4fr 90px; gap: 8px; }
+.ca-instances__ctl { grid-column: 1 / -1; }
 .ca-instances__error { padding: 8px 10px; border-radius: 8px; background: var(--ca-error-bg); color: var(--ca-error-text); font-size: 13px; }

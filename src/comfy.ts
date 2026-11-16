@@ -17,6 +17,8 @@ let lanIds: string[] = []
 let target = 'auto'
 export const setCloud = (on: boolean) => { cloud = on }
 export const setLan = (ids: string[]) => { lanIds = ids }
+let lanGuard: ((target: string) => Promise<void>) | null = null
+export const setLanGuard = (fn: (target: string) => Promise<void>) => { lanGuard = fn }
 export const setTarget = (next: string) => { target = next }
 export const cloudMode = () => cloud
 export const lanMode = () => lanIds.length > 0 && !cloud
@@ -165,13 +167,19 @@ function promptError(body: any, status: number): string {
   return top.details ? `${top.message}: ${top.details}` : top.message
 }
 
+async function dispatchRemote(init: RequestInit, prompt: PromptGraph, runOn: string) {
+  // a specific instance that is switched off gets powered on first (see instances.ts); auto never waits
+  if (runOn !== 'auto') await lanGuard?.(runOn)
+  return api('/comfyart/remote/prompt', { ...init, body: JSON.stringify({ prompt, client_id: CLIENT_ID, target: runOn }) })
+}
+
 export async function queuePrompt(prompt: PromptGraph, runOn = defaultTarget()): Promise<string> {
   const init = { method: 'POST', headers: { 'Content-Type': 'application/json' } }
   const res = cloud
     ? await api('/comfyart/cloud/prompt', { ...init, body: JSON.stringify({ prompt }) })
     : !lanMode() || runOn === 'local'
       ? await api('/prompt', { ...init, body: JSON.stringify({ prompt: withModelPaths(prompt), client_id: CLIENT_ID }) })
-      : await api('/comfyart/remote/prompt', { ...init, body: JSON.stringify({ prompt, client_id: CLIENT_ID, target: runOn }) })
+      : await dispatchRemote(init, prompt, runOn)
   const body = await res.json().catch(() => null)
   if (!res.ok) throw new Error(promptError(body, res.status))
   return String(body.prompt_id)

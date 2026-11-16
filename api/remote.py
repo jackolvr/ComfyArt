@@ -177,11 +177,27 @@ async def _power(inst: dict) -> dict:
     return {"power": body["status"], "ready": bool(body.get("ready"))}
 
 
+STATUS_FOLDERS = ("diffusion_models", "checkpoints", "text_encoders", "loras")
+
+
+async def _model_files(session: aiohttp.ClientSession, inst: dict) -> list[str]:
+    """File names the instance has in the folders the built-in models load from (the first folder must answer; the others are best effort)."""
+
+    async def one(folder: str) -> list:
+        async with session.get(f"{_base(inst)}/models/{folder}") as res:
+            body = await res.json() if res.ok else []
+            return body if isinstance(body, list) else []
+
+    first, *rest = await asyncio.gather(*(one(f) for f in STATUS_FOLDERS), return_exceptions=True)
+    if isinstance(first, BaseException):
+        raise first
+    return [m for found in (first, *rest) if isinstance(found, list) for m in found if isinstance(m, str)]
+
+
 async def _status(session: aiohttp.ClientSession, inst: dict) -> dict:
     try:
         load = await _load(session, inst)
-        async with session.get(f"{_base(inst)}/models/diffusion_models") as res:
-            models = await res.json() if res.ok else []
+        models = await _model_files(session, inst)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
         down = {"id": inst["id"], "online": False, "error": str(e) or type(e).__name__}
         # with a ctl_url, tell "switched off" (power OFF) apart from "unreachable" (power UNKNOWN or a booting state)
