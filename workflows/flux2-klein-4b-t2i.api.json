@@ -2,7 +2,7 @@
   "1": {
     "class_type": "UNETLoader",
     "inputs": {
-      "unet_name": "flux-2-klein-9b-nvfp4.safetensors",
+      "unet_name": "flux-2-klein-4b-fp8.safetensors",
       "weight_dtype": "default"
     },
     "_meta": {
@@ -12,7 +12,7 @@
   "2": {
     "class_type": "CLIPLoader",
     "inputs": {
-      "clip_name": "qwen_3_8b_fp8mixed.safetensors",
+      "clip_name": "qwen_3_4b.safetensors",
       "type": "flux2",
       "device": "default"
     }
