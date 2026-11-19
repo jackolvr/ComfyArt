@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useValue } from 'tldraw'
 
-import { installedAtom, IMAGE_MODELS, modelPrefsAtom, saveModelPrefs, VIDEO_MODELS } from '../models'
+import { IMAGE_MODELS, isInstalled, modelPrefsAtom, saveModelPrefs, VIDEO_MODELS } from '../models'
 import { Icons } from './icons'
 import { Popover } from './Popover'
 import { t } from '../i18n'
@@ -10,7 +10,8 @@ export function ModelPrefs({ onError }: { onError: (msg: string) => void }) {
   const [open, setOpen] = useState(false)
   const [tab, setTab] = useState<'image' | 'video'>('image')
   const prefs = useValue(modelPrefsAtom)
-  const installed = useValue(installedAtom)
+  // same check as generation: local files or a LAN instance that has them (installedAtom alone only knows the local ComfyUI)
+  const missingIds = useValue('model prefs missing', () => [...IMAGE_MODELS, ...VIDEO_MODELS].filter((m) => !isInstalled(m.id)).map((m) => m.id), [])
   const save = (next: typeof prefs) => void saveModelPrefs(next).catch((e) => onError(String(e)))
   const toggle = (id: string) => save({ ...prefs, enabled: prefs.enabled.includes(id) ? prefs.enabled.filter((x) => x !== id) : [...prefs.enabled, id] })
 
@@ -37,7 +38,7 @@ export function ModelPrefs({ onError }: { onError: (msg: string) => void }) {
         </div>
         <div className="ca-chat__hint">{prefs.auto ? t('modelPrefs.theAgentPicksAutomaticallyFrom') : t('modelPrefs.theAgentOnlyUsesChecked')}</div>
         {(tab === 'image' ? IMAGE_MODELS : VIDEO_MODELS).map((m) => {
-          const missing = !!installed && !installed.includes(m.id)
+          const missing = missingIds.includes(m.id)
           const on = prefs.auto || prefs.enabled.includes(m.id)
           return (
             <label key={m.id} className="ca-menu__item ca-modelprefs__row" data-missing={missing || undefined}>
